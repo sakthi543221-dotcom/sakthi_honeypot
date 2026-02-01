@@ -1,9 +1,8 @@
 import os
 import json
 import re
-from datetime import datetime
-from typing import Optional, Dict
-from fastapi import FastAPI, Header, HTTPException
+from typing import Dict
+from fastapi import FastAPI, Header, HTTPException, Request
 from dotenv import load_dotenv
 import google.generativeai as genai
 
@@ -13,10 +12,9 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 API_KEY = os.getenv("API_KEY")
 
-if not GEMINI_API_KEY or not API_KEY:
-    raise RuntimeError("Missing GEMINI_API_KEY or API_KEY in environment")
-
-genai.configure(api_key=GEMINI_API_KEY)
+# Do NOT crash app on startup (hackathon-safe)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # ================= APP =================
 app = FastAPI(
@@ -115,38 +113,55 @@ def get_honeypot(scam_type: str, stage: int):
 
 # ================= ENDPOINT =================
 @app.post("/analyze")
-def analyze(data: dict, x_api_key: str = Header(None)):
+async def analyze(request: Request, x_api_key: str = Header(None)):
     try:
+        # ---- API KEY (HEADER + QUERY FALLBACK) ----
+        if not x_api_key:
+            x_api_key = request.query_params.get("api_key")
+
         if x_api_key != API_KEY:
             raise HTTPException(status_code=401, detail="Invalid API Key")
 
-        message = data.get("message")
-        session_id = data.get("conversation_id", "default")
+        # ---- READ BODY (JSON OR TEXT) ----
+        raw_body = await request.body()
+        text = raw_body.decode("utf-8").strip()
+
+        try:
+            data = json.loads(text) if text else {}
+            message = data.get("message", text)
+            session_id = data.get("conversation_id", "default")
+        except:
+            message = text
+            session_id = "default"
 
         if not message:
             raise HTTPException(status_code=400, detail="Message required")
 
+        # ---- SESSION MEMORY ----
         if session_id not in conversation_store:
             conversation_store[session_id] = {"stage": 0}
 
         session = conversation_store[session_id]
 
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(
-            SYSTEM_PROMPT + "\nMessage:\n" + message
-        )
+        # ---- GEMINI CALL ----
+        ai_json = None
+        if GEMINI_API_KEY:
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content(
+                SYSTEM_PROMPT + "\nMessage:\n" + message
+            )
+            ai_text = response.text if response else ""
+            ai_json = safe_json(ai_text)
 
-        ai_text = response.text if response else ""
-        ai_json = safe_json(ai_text)
-
-        # -------- FALLBACK --------
+        # ---- FALLBACK (NO AI / BAD JSON) ----
         if not ai_json:
             extracted = regex_extract(message)
             is_scam = bool(extracted["upi_id"] or extracted["phishing_link"])
             scam_type = "Phishing" if extracted["phishing_link"] else "Bank Fraud"
 
             honeypot = get_honeypot(scam_type, session["stage"]) if is_scam else None
-            session["stage"] += 1 if is_scam else 0
+            if is_scam:
+                session["stage"] += 1
 
             return {
                 "is_scam": is_scam,
@@ -157,7 +172,7 @@ def analyze(data: dict, x_api_key: str = Header(None)):
                 "ethical_note": "Simulated environment only"
             }
 
-        # -------- ALWAYS HONEYPOT IF SCAM --------
+        # ---- HONEYPOT RESPONSE ----
         if ai_json.get("is_scam"):
             ai_json["honeypot_response"] = get_honeypot(
                 ai_json.get("scam_type", "Bank Fraud"),
